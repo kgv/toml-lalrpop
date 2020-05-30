@@ -1,0 +1,220 @@
+use crate::{
+    ast::{Data, Kind, Line, Lines},
+    comment::{Comment, Comments},
+    escape::{unescape, Mode},
+    key::{Key, Segment},
+    quotes::{Quoted, Quotes},
+    value::{Array, Float, Integer, Item, Table, Value},
+};
+use chrono::{DateTime, FixedOffset};
+use lalrpop_util::ParseError;
+use std::{
+    borrow::Cow,
+    convert::identity,
+    iter::once,
+    mem::{replace, take},
+};
+use itertools::Itertools;
+
+grammar;
+
+pub Toml: Table = Lines => <>.into();
+
+Lines: Lines<'input> = <line:Line> <lines:("\n"<Line>)*> => {
+    once(line).chain(lines).filter_map(identity).collect()
+};
+
+Line: Option<Line<'input>> = <data:Data?> <meta:Comment?> => {
+    let meta = if data.is_none() {
+        meta.map(Comment::Pre)
+    } else {
+        meta.map(Comment::Post)
+    };
+    Some(Line { data, meta })
+};
+
+Data: Data<'input> = {
+    "[" "[" <Key> "]" "]" => Data::Header(Kind::ArrayOfTables(<>)),
+    "[" <Key> "]" => Data::Header(Kind::Table(<>)),
+    <key:Key> "=" <value:Value> => Data::KeyValue { <> },
+}
+
+/// Key.
+Key: Key<'input> = <first:Segment> <rest:("." <Segment>)*> => once(first).chain(rest).collect();
+
+/// Key segment.
+Segment: Segment<'input> = {
+    UNQUOTED_KEY_SEGMENT => Segment::Unquoted(Cow::Borrowed(<>)),
+    Quoted => Segment::Quoted(<>),
+}
+
+/// Value.
+Value: Value = {
+    String => Value::from(<>),
+    Boolean => Value::from(<>),
+    Float => Value::from(<>),
+    Integer => Value::from(<>),
+    Array => Value::Array(<>),
+    Table => Value::Table(<>),
+}
+
+/// Table.
+Table: Table = "{" <CommaItems<(<Key> "=" <Value>)>> "}" => <>.into_iter().collect();
+
+/// Array.
+Array: Array = "[" <items:CommaItems<(Comments Value)>> <mut post:PostComments> "]" => {
+    items
+        .into_iter()
+        .enumerate()
+        .rev()
+        .map(|(index, (mut comments, value))| {
+            if index == 0 {
+                if let Some(comment) = comments.first_mut() {
+                    if let Comment::Post(v) = comment {
+                        *comment = Comment::Pre(take(v));
+                    }
+                }
+            }
+            #[cfg(feature = "drain-filter")]
+            let mut post = replace(
+                &mut post,
+                comments.drain_filter(|comment| comment.is_post()).collect(),
+            );
+            #[cfg(not(feature = "drain-filter"))]
+            let mut post = {
+                let partitioned = comments.into_iter().partition(|comment| comment.is_pre());
+                comments = partitioned.0;
+                replace(&mut post, partitioned.1)
+            };
+            comments.append(&mut post);
+            Item::new(Comments::from(comments), value)
+        })
+        .collect()
+};
+
+/// Date time.
+DateTime: DateTime<FixedOffset> = DATE_TIME =>? Ok(DateTime::parse_from_rfc3339(<>).map_err(|_| {
+    ParseError::User { error: "Parse date time." }
+})?);
+
+/// Boolean.
+Boolean: bool = BOOLEAN =>? Ok(<>.parse().map_err(|_| {
+    ParseError::User { error: "Parse boolean." }
+})?);
+
+/// Float.
+Float: Float = FLOAT =>? Ok(Float::Decimal(<>.parse().map_err(|_| {
+    ParseError::User { error: "Parse float." }
+})?));
+
+/// Integer.
+Integer: Integer = {
+    BIN_INTEGER =>? Ok(Integer::Binary(<>.trim_start_matches("0b").parse().map_err(|_| {
+        ParseError::User { error: "Parse binary integer." }
+    })?)),
+    DEC_INTEGER =>? Ok(Integer::Decimal(<>.parse().map_err(|_| {
+        ParseError::User { error: "Parse decimal integer." }
+    })?)),
+    OCT_INTEGER =>? Ok(Integer::Octal(<>.trim_start_matches("0o").parse().map_err(|_| {
+        ParseError::User { error: "Parse octal integer." }
+    })?)),
+    HEX_INTEGER =>? Ok(Integer::Hex(<>.trim_start_matches("0x").parse().map_err(|_| {
+        ParseError::User { error: "Parse hex integer." }
+    })?)),
+}
+
+/// String.
+String: Quoted<String> = Quoted => <>.map(Cow::into_owned);
+
+/// Quoted.
+Quoted: Quoted<Cow<'input, str>> = {
+    SINGLE_QUOTED_STRING => {
+        let slice = &<>[1..<>.len() - 1];
+        Quoted::SingleLine(Quotes::Single(Cow::Borrowed(slice)))
+    },
+    MULTILINE_SINGLE_QUOTED_STRING => {
+        let slice = &<>[3..<>.len() - 3];
+        Quoted::MultiLine(Quotes::Single(Cow::Borrowed(slice)))
+    },
+    DOUBLE_QUOTED_STRING =>? {
+        let slice = &<>[1..<>.len() - 1];
+        let unescaped = unescape(slice, Mode::SingleLine).try_collect().map_err(|err| {
+            ParseError::User { error: "Parse single-line double quoted string." }
+        })?;
+        Ok(Quoted::SingleLine(Quotes::Double(Cow::Owned(unescaped))))
+    },
+    MULTILINE_DOUBLE_QUOTED_STRING =>? {
+        let slice = &<>[3..<>.len() - 3];
+        let unescaped = unescape(slice, Mode::MultiLine).try_collect().map_err(|err| {
+            ParseError::User { error: "Parse multi-line double quoted string." }
+        })?;
+        Ok(Quoted::MultiLine(Quotes::Double(Cow::Owned(unescaped))))
+    },
+}
+
+// Comment.
+Comments: Vec<Comment> = <comments:(<Comment?> "\n")*> => {
+    comments
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, comment)| {
+            if index == 0 {
+                comment.map(Comment::Post)
+            } else {
+                comment.map(Comment::Pre)
+            }
+        })
+        .collect()
+};
+
+PreComments: Vec<Comment> = <comments:(<Comment?> "\n")*> => {
+    comments.into_iter().filter_map(identity).map(Comment::Pre).collect()
+};
+
+PostComments: Vec<Comment> = <comments:(<Comment?> "\n")*> => {
+    comments.into_iter().filter_map(identity).map(Comment::Post).collect()
+};
+
+Comment: String = COMMENT => <>.trim_start_matches("#").trim_end().to_string();
+
+// Utils.
+#[inline]
+CommaItems<T>: Vec<T> = {
+    <mut items:(<T> ",")*> <item:T?> => {
+        if let Some(item) = item {
+            items.push(item);
+        }
+        items
+    }
+};
+
+match {
+    r"[ \t]*" => {},
+    "\n",
+    // "\r\n" => "\n", // TODO:
+    "{",
+    "}",
+    "[",
+    "]",
+    "=",
+    ".",
+    ",",
+    r"'[\t\x{20}-\x{26}\x{28}-\x{7e}\x{80}-\x{d7ff}\x{e000}-\x{10ffff}]*'" => SINGLE_QUOTED_STRING,
+    r"'''[\t\n\x{20}-\x{26}\x{28}-\x{7e}\x{80}-\x{d7ff}\x{e000}-\x{10ffff}]*'''" => MULTILINE_SINGLE_QUOTED_STRING,
+    // r#""[\t\x{20}-\x{21}\x{23}-\x{7e}\x{80}-\x{d7ff}\x{e000}-\x{10ffff}]*""# => DOUBLE_QUOTED_STRING,
+    // r#""""("{0, 2}|[\t\n\x{20}-\x{21}\x{23}-\x{7e}\x{80}-\x{d7ff}\x{e000}-\x{10ffff}])*""""# => MULTILINE_DOUBLE_QUOTED_STRING,
+    r#""((\\")|[\t\x{20}-\x{21}\x{23}-\x{7e}\x{80}-\x{d7ff}\x{e000}-\x{10ffff}])*""# => DOUBLE_QUOTED_STRING,
+    r#""""[\t\n\x{20}-\x{7e}\x{80}-\x{d7ff}\x{e000}-\x{10ffff}]*""""# => MULTILINE_DOUBLE_QUOTED_STRING,
+    r"[-+]?[[:digit:]]+(\.[[:digit:]]+)?[eE][-+]?[[:digit:]]+|[-+]?[[:digit:]]+\.[[:digit:]]+" => FLOAT,
+    r"[-+]?(0d)?[[:digit:]][[:digit:]_]*" => DEC_INTEGER,
+    r"0b[01_]+" => BIN_INTEGER,
+    r"0o[0-7][0-7_]*" => OCT_INTEGER,
+    r"0x[[:xdigit:]][[:xdigit:]_]*" => HEX_INTEGER,
+    r"false|true" => BOOLEAN,
+    r"[[:digit:]]{4}-[[:digit:]]{2}-[[:digit:]]{2}T[[:digit:]]{2}:[[:digit:]]{2}:[[:digit:]]{2}(.[[:digit:]]+)?Z" => DATE_TIME,
+    r"#[\t\x{20}-\x{7f}\x{80}-\x{d7ff}\x{e000}-\x{10ffff}]*" => COMMENT,
+} else {
+    r"[[:alnum:]-_]+" => UNQUOTED_KEY_SEGMENT,
+    // r#""[\t\x{20}-\x{7e}\x{80}-\x{d7ff}\x{e000}-\x{10ffff}]+""# => DOUBLE_QUOTED_STRING,
+    // _
+}
